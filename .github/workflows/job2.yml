@@ -1,0 +1,55 @@
+name: MEGA job 2 (remote only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      approve_local_model:
+        description: Approve runner-only pip packages and downloading Qwen2.5-1.5B-Instruct for note extraction
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mega-job2
+  cancel-in-progress: false
+
+jobs:
+  job2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: '1'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+      - name: Require explicit inference approval
+        env:
+          APPROVED: ${{ inputs.approve_local_model }}
+        run: test "$APPROVED" = true
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install runner-local inference dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/job2-venv"
+          "$RUNNER_TEMP/job2-venv/bin/pip" --disable-pip-version-check install --quiet torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+          "$RUNNER_TEMP/job2-venv/bin/pip" --disable-pip-version-check install --quiet transformers==4.57.1
+      - name: Execute job on this GitHub-hosted runner
+        env:
+          MEGA_JOB2_URL: ${{ secrets.MEGA_JOB2_URL }}
+          MEGA_RESULT_CERT: ${{ vars.MEGA_RESULT_CERT }}
+        run: '"$RUNNER_TEMP/job2-venv/bin/python" worker/job2.py'
+      - name: Upload encrypted result and value-free audit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: job2-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            job2-output/result.cms
+            job2-output/audit.jsonl
+          if-no-files-found: warn
+          retention-days: 3
