@@ -26,7 +26,14 @@ The workflow has no push/PR trigger, uses `contents: read`, persists no checkout
 credentials, serializes runs, and has a 35-minute job timeout. The worker step has
 a separate 15-minute timeout, leaving time for artifact upload. Do not automatically
 retry a submitted or failed run: first inspect its encrypted evidence for partial
-side effects. A retry starts again with transcription as required by the skill.
+side effects. A fresh execution starts with transcription; the skill specifically
+requires restarting there if the latest step token is lost.
+The worker has no checkpoint-resume input. A saved latest step token may permit a
+separately designed remote continuation, but its validity cannot be established
+offline. Do not upload decrypted state or a private result key to enable a retry.
+Any transfer of saved notes/tokens requires separate approval and a secure handoff.
+A fresh execution repeats transcription and inference; do not assume transcription
+clears notes already stored on the job.
 
 ## Secure result handoff
 
@@ -178,8 +185,27 @@ source substrings, non-overlapping ordered evidence, and grounded context quotes
 It constructs notes from these quotes and the original offsets, preserving
 spoken clocks/timezone wording and repeated findings. It rejects text that cannot
 fit the one-line `<what happened> @m:ss` format. All final checks must pass before
-any memo write. Confirmation uses multiplicity, so identical repeated notes are
-not deduplicated. No expected notes, event totals, or receipts are hardcoded.
+any memo write. No expected notes, event totals, or receipts are hardcoded.
+
+### Confirmation response contract
+
+The job's `memo_search` returns `notes` rows with `at` (the `@m:ss` string),
+`stamps` (number of timestamp markers), `chars` (full stored note length), and
+`text` (**only the first 48 characters**, not full note text), plus the next `step`.
+The worker compares the offset, exactly one stamp, full length, and exact preview
+against its original submitted text, using a multiset so repeated occurrences each
+require a returned row. Surplus stored duplicates are not added to the submission.
+Full-text string/text-only rows are also accepted by exact equality; unrelated
+envelope strings never count as notes.
+
+This summary API cannot prove equality of the unseen tail. Exact memo-write
+requests and replies remain in encrypted RPC evidence. If two different intended
+notes have the same offset, length, and preview, or the response shape is invalid,
+confirmation stops **before rewriting** rather than guessing. Only genuinely
+missing summary multiplicity is rewritten, followed by another unfiltered search;
+persistently missing notes stop submission. A failure in an older worker that
+compared previews to full notes may already have created duplicates—inspect the
+saved evidence before authorizing any new run.
 
 Failures now retain an encrypted phase, exception type/module/message, and traceback
 frame basenames/function names/line numbers. No traceback source, locals, absolute

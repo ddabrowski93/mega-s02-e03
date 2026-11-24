@@ -567,20 +567,53 @@ def segments_from(value):
     return found[0]
 
 
-def strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for child in value.values():
-            yield from strings(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from strings(child)
+def note_summary(note):
+    """The job's search API exposes a 48-character preview, not full text."""
+    if not isinstance(note, str):
+        raise RuntimeError("invalid confirmation note")
+    match = re.fullmatch(r"[^@\r\n]+ (@[0-9]+:[0-5][0-9])", note)
+    if match is None:
+        raise RuntimeError("confirmation note must have exactly one offset")
+    return match[1], 1, len(note), note[:48]
 
 
 def missing_notes(notes, confirmed):
-    # Repeated identical occurrences still require the same number of stored notes.
-    return list((Counter(notes) - Counter(strings(confirmed))).elements())
+    if not isinstance(confirmed, dict) or not isinstance(confirmed.get("notes"), list):
+        raise RuntimeError("unsupported confirmation reply")
+    expected = Counter(notes)
+    summaries = {}
+    for note in expected:
+        signature = note_summary(note)
+        if signature in summaries and summaries[signature] != note:
+            # The API cannot distinguish tails with the same preview/length/time.
+            # Do not claim confirmation or blindly rewrite ambiguous notes.
+            raise RuntimeError("ambiguous confirmation summaries")
+        summaries[signature] = note
+    full, previews = Counter(), Counter()
+    for row in confirmed["notes"]:
+        if isinstance(row, str):
+            full[row] += 1
+        elif isinstance(row, dict) and not {"at", "stamps", "chars"}.intersection(row):
+            if not isinstance(row.get("text"), str):
+                raise RuntimeError("invalid full-text confirmation row")
+            full[row["text"]] += 1
+        elif isinstance(row, dict):
+            at, stamps, chars, text = (row.get(k) for k in ("at", "stamps", "chars", "text"))
+            if (not isinstance(at, str) or not re.fullmatch(r"@[0-9]+:[0-5][0-9]", at)
+                    or type(stamps) is not int or stamps != 1
+                    or type(chars) is not int or chars < 1
+                    or not isinstance(text, str) or len(text) != min(chars, 48)):
+                raise RuntimeError("invalid summary confirmation row")
+            previews[(at, stamps, chars, text)] += 1
+        else:
+            raise RuntimeError("unsupported confirmation row")
+    # Each returned row counts once. Exact repeats require matching multiplicity;
+    # surplus stored rows do not become extra submitted notes.
+    missing = []
+    for note, count in expected.items():
+        signature = note_summary(note)
+        missing.extend([note] * max(0, count - full[note] - previews[signature]))
+    return missing
 
 
 def confirm_notes(client, notes):

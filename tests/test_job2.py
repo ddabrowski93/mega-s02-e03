@@ -236,6 +236,78 @@ class LedgerTests(PrivateStateTests):
         self.assertEqual(client.call.call_count, 3)
 
 
+class ConfirmationSummaryTests(PrivateStateTests):
+    @staticmethod
+    def summary(note):
+        return {"at": note.rsplit(" ", 1)[-1], "stamps": 1,
+                "chars": len(note), "text": note[:48]}
+
+    def test_real_api_shape_long_previews_do_not_trigger_duplicate_writes(self):
+        notes = ["Synthetic event " + str(i) + " with grounded detail " * 5 + " @00:07"
+                 for i in range(11)]
+        client = unittest.mock.Mock()
+        client.call.return_value = {"notes": [self.summary(n) for n in notes], "step": "synthetic"}
+        job2.confirm_notes(client, notes)
+        self.assertEqual([c.args for c in client.call.call_args_list], [("memo_search", {})])
+
+    def test_duplicate_stored_summaries_are_not_extra_submission_notes(self):
+        note = "Synthetic reset " + "with context " * 6 + " @0:07"
+        rows = [self.summary(note)] * 2
+        self.assertEqual(job2.missing_notes([note], {"notes": rows}), [])
+        self.assertEqual(job2.missing_notes([note] * 3, {"notes": rows}), [note])
+
+    def test_only_missing_multiplicity_is_written_then_researched(self):
+        a, b = "Synthetic hold @0:07", "Synthetic reset @0:09"
+        client = unittest.mock.Mock()
+        client.call.side_effect = [
+            {"notes": [self.summary(a), self.summary(b)]}, {},
+            {"notes": [self.summary(a), self.summary(a), self.summary(b)]}]
+        job2.confirm_notes(client, [a, a, b])
+        self.assertEqual([c.args for c in client.call.call_args_list], [
+            ("memo_search", {}), ("memo_write", {"text": a}), ("memo_search", {})])
+
+    def test_every_summary_field_matters(self):
+        note = "Synthetic event " + "with detail " * 6 + " @00:07"
+        for field, replacement in (("at", "@0:07"), ("chars", len(note) + 1),
+                                   ("text", "X" + note[1:48])):
+            row = self.summary(note)
+            row[field] = replacement
+            with self.subTest(field=field):
+                self.assertEqual(job2.missing_notes([note], {"notes": [row]}), [note])
+
+    def test_malformed_or_partial_summaries_fail_before_rewrite(self):
+        note = "Synthetic event @0:07"
+        rows = [dict(self.summary(note), stamps=2), dict(self.summary(note), stamps=True),
+                dict(self.summary(note), chars=True), dict(self.summary(note), at="0:07"),
+                dict(self.summary(note), text=""), {"at": "@0:07", "text": note}, 1]
+        for row in rows:
+            client = unittest.mock.Mock()
+            client.call.return_value = {"notes": [row]}
+            with self.subTest(row=row), self.assertRaises(RuntimeError):
+                job2.confirm_notes(client, [note])
+            self.assertEqual(client.call.call_count, 1)
+
+    def test_ambiguous_truncated_tails_fail_instead_of_guessing_or_rewriting(self):
+        prefix = "Synthetic finding with a shared preview " + "x" * 48
+        notes = [prefix + "A @0:07", prefix + "B @0:07"]
+        client = unittest.mock.Mock()
+        client.call.return_value = {"notes": [self.summary(n) for n in notes]}
+        with self.assertRaisesRegex(RuntimeError, "ambiguous confirmation"):
+            job2.confirm_notes(client, notes)
+        self.assertEqual(client.call.call_count, 1)
+
+    def test_unrelated_envelope_strings_cannot_confirm_missing_notes(self):
+        note = "Synthetic event @0:07"
+        self.assertEqual(job2.missing_notes([note], {"notes": [], "step": note}), [note])
+        with self.assertRaisesRegex(RuntimeError, "unsupported confirmation reply"):
+            job2.missing_notes([note], {"other": note})
+
+    def test_short_summary_and_full_text_rows_count_once_each(self):
+        note = "Synthetic reset @0:07"
+        rows = [self.summary(note), {"text": note}, note]
+        self.assertEqual(job2.missing_notes([note] * 4, {"notes": rows}), [note])
+
+
 def completion_reply(content="{}", **overrides):
     reply = {"model": job2.MODEL, "choices": [{"finish_reason": "stop", "message": {
         "role": "assistant", "content": content}}],
