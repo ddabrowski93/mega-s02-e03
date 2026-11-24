@@ -188,25 +188,58 @@ class LedgerTests(unittest.TestCase):
             with self.subTest(ranges=ranges), self.assertRaises(RuntimeError):
                 job2.event_spans([[], ranges, [[0, 5]]], self.units)
 
-    def test_compact_pipeline_has_only_two_small_passes(self):
+    def synthetic_selection(self):
+        return [[0], [2], [0, 5], [6, 9], [1], [0, 5]]
+
+    def test_program_enumerates_every_unit_with_tiny_constrained_replies(self):
         calls = []
-        def infer(prompt, budget):
-            calls.append(budget)
-            return self.ledger if len(calls) == 1 else [1, 1, 1]
+        responses = iter(self.synthetic_selection() + [[1], [1], [1]])
+        def infer(prompt, choices):
+            calls.append(choices)
+            result = next(responses)
+            self.assertIn(json.dumps(result, separators=(",", ":")), choices)
+            return result
         with patch.object(job2, "audit") as audit:
             notes = job2.compact_extract("synthetic skill", self.transcript, infer)
         self.assertEqual(len(notes), 3)
-        self.assertEqual(calls, [512, 41])
+        self.assertEqual(len(calls), 9)
+        self.assertTrue(all(len(json.loads(choice)) in (1, 2) for choices in calls for choice in choices))
+        self.assertEqual(job2.STATE["findings"], self.ledger)
         self.assertEqual(job2.STATE["local_verification"], [1, 1, 1])
+        self.assertTrue(all(p["selected"] and p["verified"] for p in job2.STATE["unit_progress"]))
         self.assertEqual([call.args for call in audit.call_args_list], [
-            ("inference_select", "started"), ("inference_verify", "started"),
+            ("inference_count", "started"), ("inference_count", "started"),
+            ("inference_span", "started"), ("inference_span", "started"),
+            ("inference_count", "started"), ("inference_span", "started"),
+            ("inference_assemble", "started"),
+            ("inference_verify", "started"), ("inference_verify", "started"),
+            ("inference_verify", "started"),
             ("inference_complete", "started")])
 
     def test_every_unit_requires_positive_independent_audit(self):
-        for audit in ([1, 0, 1], [1, 1], [True, True, True], {"ok": True}):
-            responses = iter([self.ledger, audit])
-            with self.subTest(audit=audit), self.assertRaises(RuntimeError):
+        for audit in ([0], [2]):
+            responses = iter(self.synthetic_selection() + [audit])
+            with self.subTest(audit=audit), self.assertRaisesRegex(RuntimeError, "audit rejected"):
                 job2.compact_extract("synthetic skill", self.transcript, lambda *args: next(responses))
+            # Even the first context-only unit must pass an independent audit.
+            self.assertFalse(job2.STATE["unit_progress"][0]["verified"])
+
+    def test_count_uncertainty_stops_without_spans_or_audit(self):
+        calls = []
+        def infer(prompt, choices):
+            calls.append(choices)
+            return [job2.MAX_EVENTS_PER_UNIT + 1]
+        with self.assertRaisesRegex(RuntimeError, "uncertain"):
+            job2.compact_extract("synthetic skill", self.transcript, infer)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(job2.STATE["unit_progress"][0]["selected"])
+
+    def test_invalid_global_style_reply_is_repaired_only_for_current_unit(self):
+        responses = iter([[["not", "indices"]]] + self.synthetic_selection() + [[1], [1], [1]])
+        notes = job2.compact_extract("synthetic skill", self.transcript, lambda *args: next(responses))
+        self.assertEqual(len(notes), 3)
+        self.assertEqual(len(job2.STATE["format_repairs"]), 1)
+        self.assertEqual(job2.STATE["format_repairs"][0]["unit"], 0)
 
     def test_clocks_are_not_inherited_or_guessed_between_events(self):
         transcript = [{"at": "0:07", "text": "stalled 06:20 reset"}]
@@ -335,10 +368,88 @@ class BudgetTests(unittest.TestCase):
         with patch.object(job2, "MAX_UNITS", 1), self.assertRaises(RuntimeError):
             job2.source_units([{"at": "0:00", "text": "Hello. Goodbye."}])
 
+    def test_source_word_bounds_never_truncate(self):
+        with patch.object(job2, "MAX_WORDS_PER_UNIT", 2), self.assertRaises(RuntimeError):
+            job2.source_units([{"at": "0:00", "text": "Line C reset."}])
+
     def test_only_complete_json_is_accepted(self):
         self.assertEqual(job2.parse_json_output("```json\n[[],[[0,3]]]\n```"), [[], [[0, 3]]])
         with self.assertRaises(ValueError):
             job2.parse_json_output("[[],[[0,")
+
+
+class ConstrainedReplyTests(unittest.TestCase):
+    def test_token_trie_forbids_strings_missing_rows_and_extra_text(self):
+        # Character tokens stand in for real tokenizer encodings; no model is loaded.
+        choices = ["[0]", "[1]", "[2]"]
+        trie = job2.ChoiceTrie([list(map(ord, choice)) for choice in choices])
+        self.assertEqual(trie.allowed([], 999), [ord("[")])
+        self.assertEqual(trie.allowed([ord("[")], 999), [ord("0"), ord("1"), ord("2")])
+        self.assertTrue(trie.complete(list(map(ord, "[1]"))))
+        self.assertFalse(trie.complete(list(map(ord, "[1"))))
+        self.assertEqual(trie.allowed(list(map(ord, "[1]")), 999), [999])
+        for bad in ('["', "[[", "[9", "[1]extra"):
+            with self.subTest(bad=bad), self.assertRaises(job2.InvalidModelOutput):
+                trie.node(list(map(ord, bad)))
+
+    def test_pair_trie_accepts_only_listed_nonoverlapping_word_bounds(self):
+        trie = job2.ChoiceTrie([list(map(ord, choice)) for choice in ("[3,4]", "[3,5]", "[4,5]")])
+        self.assertTrue(trie.complete(list(map(ord, "[3,5]"))))
+        with self.assertRaises(job2.InvalidModelOutput):
+            trie.node(list(map(ord, "[2,")))
+
+    def test_trie_supports_variable_length_subword_tokenizations(self):
+        trie = job2.ChoiceTrie([[10, 11], [10, 12, 13]])
+        self.assertEqual(trie.max_tokens, 3)
+        self.assertEqual(trie.allowed([10], 99), [11, 12])
+        self.assertTrue(trie.complete([10, 11]))
+        self.assertFalse(trie.complete([10, 12]))
+        self.assertEqual(trie.allowed([10, 12], 99), [13])
+
+    def test_no_choices_fails_without_inference(self):
+        def infer(*args):
+            self.fail("inference must not be attempted with an empty grammar")
+        with self.assertRaises(RuntimeError):
+            job2.ask_choice(infer, "synthetic prompt", [])
+
+    def test_invalid_response_has_at_most_one_repair(self):
+        calls = []
+        def invalid(prompt, choices):
+            calls.append(prompt)
+            return [["arbitrary", "strings"]]
+        with patch.object(job2, "STATE", {"phase": "inference_count"}), \
+                patch.object(job2, "audit"), self.assertRaises(job2.InvalidModelOutput):
+            job2.ask_choice(invalid, "synthetic prompt", ["[0]", "[1]"])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Format repair", calls[1])
+
+    def test_truncated_json_can_repair_once(self):
+        calls = []
+        def infer(prompt, choices):
+            calls.append(prompt)
+            if len(calls) == 1:
+                raise job2.InvalidModelOutput("synthetic truncated JSON")
+            return [1]
+        with patch.object(job2, "STATE", {"phase": "inference_verify"}), patch.object(job2, "audit"):
+            self.assertEqual(job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"]), [1])
+        self.assertEqual(len(calls), 2)
+
+    def test_semantically_rejecting_reply_is_not_repaired(self):
+        calls = []
+        def infer(prompt, choices):
+            calls.append(prompt)
+            return [0]
+        self.assertEqual(job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"]), [0])
+        self.assertEqual(len(calls), 1)
+
+    def test_deadline_is_never_treated_as_a_format_error(self):
+        calls = []
+        def infer(prompt, choices):
+            calls.append(prompt)
+            raise job2.InferenceTimeout("synthetic timeout")
+        with self.assertRaises(job2.InferenceTimeout):
+            job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"])
+        self.assertEqual(len(calls), 1)
 
 
 class DiagnosticTests(unittest.TestCase):

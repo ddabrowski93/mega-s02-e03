@@ -119,12 +119,30 @@ rewritten.
 
 Remote extraction splits each source segment conservatively at sentence/semicolon
 boundaries into candidate units, retaining exact source coordinates. Conjunctions
-are not assumed to be event boundaries. The first model pass outputs one array row
-for **every** unit: `[]` for chatter or a list of half-open word-index spans for all
-event occurrences. Multiple events in the same sentence use separate non-overlapping
-spans. The worker validates coverage, integer bounds, order, and grounding, then
-copies the selected text verbatim. It does not classify incidents by a keyword
-filter and does not contain clip-specific answers or expected event counts.
+are not assumed to be event boundaries. **Python enumerates every unit**, owns the
+coverage ledger, and records selected/verified progress; the model cannot omit,
+rename, or reorder rows. For each unit independently:
+
+1. Count actual event occurrences with a tiny JSON response such as `[0]` or `[2]`.
+   The count can be zero through eight; `[9]` explicitly means uncertain/over limit
+   and stops execution. These are generic safety limits, not expected clip counts.
+2. For each event, select only `[first_word,after_last_word]` from valid half-open
+   source-word intervals. Multiple events have distinct ordered non-overlapping
+   spans. Text is copied verbatim, not generated.
+3. After context assembly, independently audit **each** unit, including zero-event
+   units: `[1]` accepts, `[0]` rejects, `[2]` is uncertain. All units must pass before
+   any memo write. This remains the same model in fresh stateless calls, not an
+   independently trained verifier.
+
+Decoding is constrained using a tokenizer-based finite-choice trie and Hugging
+Face's `prefix_allowed_tokens_fn`. Only allowed numeric JSON replies can complete;
+there is no vocabulary-wide scan or extra grammar dependency. A model therefore
+cannot replace indices with strings or output an incomplete global ledger as it
+could under prompt-only formatting. Bounds, ordering, and exact grounding are also
+validated outside the model. A malformed/truncated response may receive **one**
+format-repair attempt for that single call; a second failure stops. Semantic audit
+rejection or uncertainty is never retried into agreement. No keyword filter decides
+whether an incident happened; no clip-specific answers or event totals are encoded.
 
 Clock/date/timezone/line context is assembled automatically from exact source text
 using generic English context patterns. Context-only date/zone declarations are
@@ -133,16 +151,19 @@ mention. The latest preceding context is preferred. A later date/zone declaratio
 is a tentative fallback only if no earlier one exists. Numeric clocks outside a
 selected span may be attached only to their unique closest event in the same unit;
 ties fail rather than guess. Spoken clocks are never converted or rounded. The
-independent second pass must explicitly approve every unit for completeness,
+independent per-unit audit must explicitly approve every unit for completeness,
 one-event grouping, no chatter, correct context scope, and original offsets.
-Any rejection, malformed output, or uncertainty stops before memo writes. There
-are no verbose repair loops. Confirmation counts duplicate notes.
+Any rejection, unrepaired invalid output, or uncertainty stops before memo writes.
+There are no global ledger/prose repair loops. Confirmation counts duplicate notes.
 
-Inference limits: model loading plus both passes share an eight-minute SIGALRM
-deadline; each generation has a 120-second `max_time`, bounded output (512 tokens
-for span selection; at most 416 for audit), and early stopping once complete JSON
-is emitted. A total 1,536-generated-token budget is enforced. Inputs above 128
-candidate units or 6,144 prompt tokens fail instead of truncating or skipping text.
+Inference limits: model loading, all counts/spans, any format repairs, and all audits
+share an eight-minute SIGALRM deadline. Each tiny generation has a 30-second
+`max_time`, an output-token limit derived from the longest allowed choice plus one
+EOS token, and early stopping at a complete allowed response. A total
+1,536-generated-token budget is enforced. Inputs above 128 candidate units, 96
+words in one unit, or 6,144 prompt tokens fail instead of truncating/skipping text.
+Prompts target only one unit, its immediate neighbors, and verbatim date/zone
+references; they do not repeatedly request a full-transcript generated ledger.
 Normal inference is intended to fit within about ten minutes including downloads,
 but throughput/download latency is not guaranteed. A blocked native operation can
 delay Python signal handling; the preceding encrypted checkpoint remains available.
