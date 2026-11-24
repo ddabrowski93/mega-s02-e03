@@ -20,7 +20,8 @@ is needed to:
    GitHub-hosted runner. No separate transcription service is used.
 
 The workflow has no push/PR trigger, uses `contents: read`, persists no checkout
-credentials, serializes runs, and has a 35-minute timeout. Do not automatically
+credentials, serializes runs, and has a 35-minute job timeout. The worker step has
+a separate 15-minute timeout, leaving time for artifact upload. Do not automatically
 retry a submitted or failed run: first inspect its encrypted evidence for partial
 side effects. A retry starts again with transcription as required by the skill.
 
@@ -48,9 +49,18 @@ openssl cms -decrypt -binary -inform DER -in result.cms \
 
 Output uses authenticated CMS AES-256-GCM encryption with an RSA recipient.
 Encryption is preflighted before any job call. No plaintext transcript, tokens,
-endpoint, notes, or receipts are written to disk. The in-memory result is encrypted
-on normal completion and caught failure. Abrupt runner termination/OOM may prevent
-final encryption; the existing artifact can then contain only the preflight state.
+endpoint, notes, or receipts are written to disk. Encrypted checkpoints are written
+before/after every RPC, after tool decoding/token update, at inference phase
+boundaries, and after each generated response. Ciphertext is written to a temporary
+file and atomically renamed over the last successful `result.cms` only after
+encryption succeeds. Failed encryption leaves the prior checkpoint intact.
+
+SIGINT/SIGTERM request a graceful stop with encrypted failure diagnostics; a signal
+during checkpointing is deferred until that checkpoint is complete. Hard kill/OOM
+can still prevent the final checkpoint or upload, but any uploaded artifact retains
+the latest successful checkpoint (including transcription before model load), not
+just preflight. `pending_rpc` means a request may have had remote effects even if
+no reply was recorded: inspect privately and never assume it is safe to retry.
 
 The encrypted JSON includes **exact unmodified parsed JSON-RPC tool reply objects**
 under `exchanges`, including the submit reply and its receipt; `submission` contains
@@ -92,10 +102,12 @@ stop and obtain approval for a revised approach; do not silently switch services
 MCP, skill download, audit, and encryption use Python's standard library and the
 runner's OpenSSL. Runner-only NLP dependencies are CPU PyTorch 2.9.1 and Transformers
 4.57.1 (plus their pip dependencies), and public model
-`Qwen/Qwen2.5-1.5B-Instruct` (several GB). Dependencies are installed in a temporary
-virtual environment, not globally. The model uses safetensors, disallows custom
-remote Python code, uses deterministic generation, grounds each finding in an
-exact segment substring, and performs a second coverage/timestamp review.
+`Qwen/Qwen2.5-0.5B-Instruct` (about 1 GB model download, roughly 2 GB float32 weights
+in memory, plus runtime overhead). It runs on CPU with float32, avoiding potentially
+unaccelerated CPU bfloat16. Dependencies are installed in a temporary virtual
+environment, not globally. The model uses safetensors, disallows custom remote
+Python code, uses deterministic generation, and outputs only compact numeric spans
+and audit flags, never a generated prose ledger.
 
 ### Parser and extraction safeguards
 
@@ -105,16 +117,36 @@ are formatted without rounding. Fractional, missing, invalid, or conflicting off
 stop the worker rather than inventing a timestamp. Original segment data is not
 rewritten.
 
-Remote extraction creates a coverage ledger with a row for **every** segment,
-including chatter, and a separate entry for every event occurrence. Notes quote
-the actual event wording and any necessary clock/date/timezone/line context from
-validated source substrings. Spoken times and timezone context are not normalized
-or paraphrased. A second inference pass must positively audit every segment for
-coverage, repeats, one-event grouping, timestamps, and inherited context. Audit
-issues allow up to two remote repair passes before stopping, always before memo
-writes. Generated responses and diagnostics remain encrypted. This increases
-checks, but does not make a small language model infallible. Confirmation counts
-duplicate notes rather than treating repeated findings as a set.
+Remote extraction splits each source segment conservatively at sentence/semicolon
+boundaries into candidate units, retaining exact source coordinates. Conjunctions
+are not assumed to be event boundaries. The first model pass outputs one array row
+for **every** unit: `[]` for chatter or a list of half-open word-index spans for all
+event occurrences. Multiple events in the same sentence use separate non-overlapping
+spans. The worker validates coverage, integer bounds, order, and grounding, then
+copies the selected text verbatim. It does not classify incidents by a keyword
+filter and does not contain clip-specific answers or expected event counts.
+
+Clock/date/timezone/line context is assembled automatically from exact source text
+using generic English context patterns. Context-only date/zone declarations are
+quoted verbatim; line identity can be inherited from an earlier explicit source
+mention. The latest preceding context is preferred. A later date/zone declaration
+is a tentative fallback only if no earlier one exists. Numeric clocks outside a
+selected span may be attached only to their unique closest event in the same unit;
+ties fail rather than guess. Spoken clocks are never converted or rounded. The
+independent second pass must explicitly approve every unit for completeness,
+one-event grouping, no chatter, correct context scope, and original offsets.
+Any rejection, malformed output, or uncertainty stops before memo writes. There
+are no verbose repair loops. Confirmation counts duplicate notes.
+
+Inference limits: model loading plus both passes share an eight-minute SIGALRM
+deadline; each generation has a 120-second `max_time`, bounded output (512 tokens
+for span selection; at most 416 for audit), and early stopping once complete JSON
+is emitted. A total 1,536-generated-token budget is enforced. Inputs above 128
+candidate units or 6,144 prompt tokens fail instead of truncating or skipping text.
+Normal inference is intended to fit within about ten minutes including downloads,
+but throughput/download latency is not guaranteed. A blocked native operation can
+delay Python signal handling; the preceding encrypted checkpoint remains available.
+Generated responses and diagnostics stay encrypted.
 
 Failures now retain an encrypted phase, exception type/module/message, and traceback
 frame basenames/function names/line numbers. No traceback source, locals, absolute
@@ -127,8 +159,11 @@ Offline synthetic tests (no private files, HTTP, model loading, or job execution
 python3 -B -m unittest discover -s tests -v
 ```
 
-**Limitations:** a small local language model is not a guarantee of correct or
-complete extraction; only the job's acceptance is authoritative. Its model
+**Limitations:** the smaller model is faster but less capable; agreement with its
+own independent audit is not a guarantee of complete/correct extraction. English
+context patterns are not a complete parser of natural-language clock/timezone
+scope, uncommon zone names, or spoken dates; incorrect or uncertain associations
+must be rejected by the audit. Only the job's acceptance is authoritative. Its model
 revision and transitive pip dependencies are not locked. The model may exceed
 runner resources or the timeout. Approve this inference approach explicitly
 before dispatch, or replace it with another separately approved runner-only

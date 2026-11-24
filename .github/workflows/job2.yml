@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       approve_local_model:
-        description: Approve runner-only pip packages and downloading Qwen2.5-1.5B-Instruct for note extraction
+        description: Approve runner-only pip packages and downloading Qwen2.5-0.5B-Instruct for compact CPU note extraction
         type: boolean
         required: true
         default: false
@@ -39,6 +39,7 @@ jobs:
           "$RUNNER_TEMP/job2-venv/bin/pip" --disable-pip-version-check install --quiet torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
           "$RUNNER_TEMP/job2-venv/bin/pip" --disable-pip-version-check install --quiet transformers==4.57.1
       - name: Execute job on this GitHub-hosted runner
+        timeout-minutes: 15
         env:
           MEGA_JOB2_URL: ${{ secrets.MEGA_JOB2_URL }}
           MEGA_RESULT_CERT: ${{ vars.MEGA_RESULT_CERT }}
