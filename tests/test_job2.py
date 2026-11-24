@@ -1,6 +1,9 @@
 """Offline synthetic tests only: never load private results or invoke inference/HTTP."""
 
 import importlib.util
+import copy
+from decimal import Decimal
+import io
 import json
 from pathlib import Path
 import signal
@@ -142,131 +145,307 @@ class SchemaTests(unittest.TestCase):
                          {"step": "synthetic"})
 
 
-class LedgerTests(unittest.TestCase):
+class PrivateStateTests(unittest.TestCase):
     def setUp(self):
         for target, replacement in (("STATE", {"exchanges": []}), ("audit", lambda *args: None),
                                     ("CHECKPOINT_CERT", None)):
             patcher = patch.object(job2, target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.transcript = [
-            {"at": "0:01", "text": "All times here are UTC plus two."},
-            {"at": "0:07", "text": "Line C stalled at 06:20 and reset at 06:21."},
-            {"at": "0:11", "text": "Line C stalled at 06:23."},
-        ]
-        self.ledger = [[], [[0, 5], [6, 9]], [[0, 5]]]
-        self.units = job2.source_units(self.transcript)
 
-    def test_multiple_events_repeats_clocks_and_timezone(self):
-        notes = job2.render_events(self.ledger, self.units, self.transcript)
-        self.assertEqual(len(notes), 3)
-        self.assertEqual(notes[0], "Line C stalled at 06:20 [context: All times here are UTC plus two.] @0:07")
+
+def synthetic_ledger(verified=False):
+    context = [{"segment": 0, "quote": "All times are UTC plus two."}]
+    result = {"segments": [{"segment": 0, "events": []}, {"segment": 1, "events": [
+        {"evidence": "Line C stalled at 06:20", "occurrence": 0, "context": context},
+        {"evidence": "reset at 06:21.", "occurrence": 0,
+         "context": context + [{"segment": 1, "quote": "Line C"}]},
+    ]}]}
+    if verified:
+        result.update({"complete_and_exact": True, "uncertain": False, "issues": []})
+        for row in result["segments"]:
+            row["verified"] = True
+    return result
+
+
+def synthetic_transcript():
+    return [{"at": "0:01", "text": "All times are UTC plus two."},
+            {"at": "00:07", "text": "Line C stalled at 06:20 and reset at 06:21."}]
+
+
+class LedgerTests(PrivateStateTests):
+    def test_multi_event_grounding_clock_timezone_and_original_offset(self):
+        notes = job2.notes_from_ledger(synthetic_ledger(True), synthetic_transcript(), verified=True)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("stalled at 06:20", notes[0])
         self.assertIn("reset at 06:21.", notes[1])
+        self.assertTrue(all("UTC plus two" in note and note.endswith("@00:07") for note in notes))
         self.assertIn("Line C", notes[1])
-        self.assertIn("All times here are UTC plus two.", notes[1])
-        self.assertTrue(notes[1].endswith("@0:07"))
-        self.assertTrue(notes[2].endswith("@0:11"))
 
-    def test_unit_source_coordinates_and_sentence_splitting(self):
-        transcript = [{"at": "00:07", "text": "  Hello.  Line C stalled; then reset.  "}]
-        units = job2.source_units(transcript)
-        self.assertEqual([u["text"] for u in units], ["Hello.", "Line C stalled;", "then reset."])
-        for unit in units:
-            text = transcript[unit["segment"]]["text"]
-            self.assertEqual(text[unit["start"]:unit["start"] + len(unit["text"])], unit["text"])
-        notes = job2.render_events([[], [[0, 3]], [[0, 2]]], units, transcript)
-        self.assertEqual(len(notes), 2)
-        self.assertTrue(all(note.endswith("@00:07") for note in notes))
+    def test_every_segment_must_be_present_ordered_and_verified(self):
+        for mutation in ("missing", "order", "unverified", "bool_index"):
+            ledger = synthetic_ledger(True)
+            if mutation == "missing":
+                ledger["segments"].pop(0)
+            elif mutation == "order":
+                ledger["segments"].reverse()
+            elif mutation == "unverified":
+                ledger["segments"][0]["verified"] = False
+            else:
+                ledger["segments"][0]["segment"] = False
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                job2.notes_from_ledger(ledger, synthetic_transcript(), verified=True)
 
-    def test_omitted_unit_is_not_silently_accepted(self):
-        with self.assertRaises(RuntimeError):
-            job2.render_events(self.ledger[1:], self.units, self.transcript)
+    def test_invented_context_evidence_and_duplicate_occurrence_rejected(self):
+        for mutation in ("evidence", "context", "duplicate", "occurrence"):
+            ledger = synthetic_ledger()
+            event = ledger["segments"][1]["events"][0]
+            if mutation == "evidence":
+                event["evidence"] = "Invented fault"
+            elif mutation == "context":
+                event["context"][0]["quote"] = "UTC minus six"
+            elif mutation == "duplicate":
+                ledger["segments"][1]["events"].insert(1, copy.deepcopy(event))
+            else:
+                event["occurrence"] = 1
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                job2.notes_from_ledger(ledger, synthetic_transcript())
 
-    def test_bad_or_overlapping_ranges_rejected(self):
-        for ranges in ([[0, 100]], [[-1, 2]], [[True, 2]], [[3, 2]],
-                       [[0, 4], [3, 5]], [[0, 0]], "invented"):
-            with self.subTest(ranges=ranges), self.assertRaises(RuntimeError):
-                job2.event_spans([[], ranges, [[0, 5]]], self.units)
+    def test_identical_repeated_occurrences_are_not_merged(self):
+        text = "Line C reset."
+        transcript = [{"at": "0:07", "text": text + " " + text}]
+        ledger = {"segments": [{"segment": 0, "events": [
+            {"evidence": text, "occurrence": n, "context": []} for n in (0, 1)]}]}
+        notes = job2.notes_from_ledger(ledger, transcript)
+        self.assertEqual(notes, [text + " @0:07", text + " @0:07"])
 
-    def synthetic_selection(self):
-        return [[0], [2], [0, 5], [6, 9], [1], [0, 5]]
-
-    def test_program_enumerates_every_unit_with_tiny_constrained_replies(self):
-        calls = []
-        responses = iter(self.synthetic_selection() + [[1], [1], [1]])
-        def infer(prompt, choices):
-            calls.append(choices)
-            result = next(responses)
-            self.assertIn(json.dumps(result, separators=(",", ":")), choices)
-            return result
-        with patch.object(job2, "audit") as audit:
-            notes = job2.compact_extract("synthetic skill", self.transcript, infer)
-        self.assertEqual(len(notes), 3)
-        self.assertEqual(len(calls), 9)
-        self.assertTrue(all(len(json.loads(choice)) in (1, 2) for choices in calls for choice in choices))
-        self.assertEqual(job2.STATE["findings"], self.ledger)
-        self.assertEqual(job2.STATE["local_verification"], [1, 1, 1])
-        self.assertTrue(all(p["selected"] and p["verified"] for p in job2.STATE["unit_progress"]))
-        self.assertEqual([call.args for call in audit.call_args_list], [
-            ("inference_count", "started"), ("inference_count", "started"),
-            ("inference_span", "started"), ("inference_span", "started"),
-            ("inference_count", "started"), ("inference_span", "started"),
-            ("inference_assemble", "started"),
-            ("inference_verify", "started"), ("inference_verify", "started"),
-            ("inference_verify", "started"),
-            ("inference_complete", "started")])
-
-    def test_every_unit_requires_positive_independent_audit(self):
-        for audit in ([0], [2]):
-            responses = iter(self.synthetic_selection() + [audit])
-            with self.subTest(audit=audit), self.assertRaisesRegex(RuntimeError, "audit rejected"):
-                job2.compact_extract("synthetic skill", self.transcript, lambda *args: next(responses))
-            # Even the first context-only unit must pass an independent audit.
-            self.assertFalse(job2.STATE["unit_progress"][0]["verified"])
-
-    def test_count_uncertainty_stops_without_spans_or_audit(self):
-        calls = []
-        def infer(prompt, choices):
-            calls.append(choices)
-            return [job2.MAX_EVENTS_PER_UNIT + 1]
-        with self.assertRaisesRegex(RuntimeError, "uncertain"):
-            job2.compact_extract("synthetic skill", self.transcript, infer)
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(job2.STATE["unit_progress"][0]["selected"])
-
-    def test_invalid_global_style_reply_is_repaired_only_for_current_unit(self):
-        responses = iter([[["not", "indices"]]] + self.synthetic_selection() + [[1], [1], [1]])
-        notes = job2.compact_extract("synthetic skill", self.transcript, lambda *args: next(responses))
-        self.assertEqual(len(notes), 3)
-        self.assertEqual(len(job2.STATE["format_repairs"]), 1)
-        self.assertEqual(job2.STATE["format_repairs"][0]["unit"], 0)
-
-    def test_clocks_are_not_inherited_or_guessed_between_events(self):
-        transcript = [{"at": "0:07", "text": "stalled 06:20 reset"}]
-        with self.assertRaises(RuntimeError):
-            job2.render_events([[[0, 1], [2, 3]]], job2.source_units(transcript), transcript)
-
-    def test_explicit_context_change_is_preserved(self):
-        transcript = [{"at": "0:00", "text": "All times are UTC plus two."},
-                      {"at": "0:03", "text": "Line C stalled at 06:20."},
-                      {"at": "0:06", "text": "From here, times are UTC plus one."},
-                      {"at": "0:09", "text": "Line C reset at 06:21."}]
-        notes = job2.render_events([[], [[0, 5]], [], [[0, 5]]], job2.source_units(transcript), transcript)
-        self.assertIn("UTC plus two", notes[0])
-        self.assertNotIn("UTC plus one", notes[0])
-        self.assertIn("UTC plus one", notes[1])
-
-    def test_identical_occurrences_are_not_deduplicated(self):
-        transcript = [{"at": "0:07", "text": "Line C reset. Line C reset."}]
-        notes = job2.render_events([[[0, 3]], [[0, 3]]], job2.source_units(transcript), transcript)
-        self.assertEqual(len(notes), 2)
-        self.assertEqual(notes[0], notes[1])
-
-    def test_confirmation_counts_repeated_notes(self):
+    def test_confirmation_counts_repeats_and_rewrites_missing_then_searches(self):
         note = "Synthetic repeated hold @0:07"
         self.assertEqual(job2.missing_notes([note, note], {"notes": [{"text": note}]}), [note])
-        self.assertEqual(job2.missing_notes([note, note], {"notes": [note, note]}), [])
-        self.assertEqual(job2.missing_notes([note], {"notes": [note + " extra"]}), [note])
+        client = unittest.mock.Mock()
+        client.call.side_effect = [{"notes": [note]}, {}, {"notes": [note, note]}]
+        job2.confirm_notes(client, [note, note])
+        self.assertEqual([c.args for c in client.call.call_args_list], [
+            ("memo_search", {}), ("memo_write", {"text": note}), ("memo_search", {})])
+
+    def test_persistently_missing_notes_stop_after_second_search(self):
+        client = unittest.mock.Mock()
+        client.call.side_effect = [{"notes": []}, {}, {"notes": []}]
+        with self.assertRaises(RuntimeError):
+            job2.confirm_notes(client, ["Synthetic fault @0:07"])
+        self.assertEqual(client.call.call_count, 3)
+
+
+def completion_reply(content="{}", **overrides):
+    reply = {"model": job2.MODEL, "choices": [{"finish_reason": "stop", "message": {
+        "role": "assistant", "content": content}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200, "cost": 0.001}}
+    reply.update(overrides)
+    manager = unittest.mock.MagicMock()
+    manager.__enter__.return_value.read.return_value = job2.json_bytes(reply)
+    return manager
+
+
+class OpenRouterTests(PrivateStateTests):
+    def setUp(self):
+        super().setUp()
+        self.key = "synthetic-api-key-not-a-real-credential"
+        self.client = job2.OpenRouterClient(api_key=self.key)
+        self.messages = [{"role": "user", "content": "Synthetic transcript only."}]
+        self.schema = job2.ledger_schema()
+
+    def test_two_requests_total_fixed_model_privacy_prices_and_no_auth_in_state(self):
+        snapshots = []
+        with patch.object(job2.HTTP, "open", side_effect=[completion_reply(), completion_reply()]) as opened, \
+                patch.object(job2, "checkpoint", side_effect=lambda: snapshots.append(copy.deepcopy(job2.STATE))):
+            self.client.complete(self.messages, self.schema)
+            job2.OpenRouterClient(api_key=self.key).complete(self.messages, self.schema)
+            with self.assertRaises(RuntimeError):
+                self.client.complete(self.messages, self.schema)
+        self.assertEqual(opened.call_count, 2)
+        request = opened.call_args_list[0].args[0]
+        self.assertEqual(request.full_url, job2.OPENROUTER_URL)
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + self.key)
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "openai/gpt-4.1-mini")
+        self.assertEqual(payload["provider"], {
+            "max_price": {"prompt": 0.4, "completion": 1.6}, "require_parameters": True,
+            "data_collection": "deny", "allow_fallbacks": False})
+        self.assertEqual(payload["plugins"], [])
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("models", payload)
+        self.assertEqual(payload["max_tokens"], 8000)
+        self.assertEqual(snapshots[0]["openrouter"]["requests"][0]["status"], "pending")
+        self.assertGreater(Decimal(snapshots[0]["openrouter"]["reserved_usd"]), 0)
+        self.assertEqual(self.client.budget["reported_usd"], "0.002")
+        self.assertNotIn(self.key, json.dumps(job2.STATE))
+
+    def test_utf8_byte_limit_not_character_limit(self):
+        messages = [{"role": "user", "content": "ą" * 30_001}]
+        self.assertLess(len(json.dumps(messages, ensure_ascii=False)), job2.MAX_MESSAGE_BYTES)
+        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+            self.client.complete(messages, self.schema)
+        self.assertFalse(self.client.budget["requests"])
+
+    def test_reservations_and_caps_are_checked_before_network(self):
+        with patch.object(job2, "BUDGET_USD", Decimal("0.000001")), self.assertRaisesRegex(RuntimeError, "budget"):
+            self.client.complete(self.messages, self.schema)
+        for tokens in (0, True, 8001):
+            with self.subTest(tokens=tokens), self.assertRaises(RuntimeError):
+                self.client.complete(self.messages, self.schema, max_tokens=tokens)
+        with self.assertRaisesRegex(RuntimeError, "overhead"):
+            self.client.complete(self.messages, {"description": "x" * 9000})
+        self.assertFalse(self.client.budget["requests"])
+        bound = 2 * ((60_000 + 8192) * Decimal("0.0000004") + 8000 * Decimal("0.0000016"))
+        self.assertEqual(bound, Decimal("0.0801536"))
+
+    def test_timeout_reserves_attempt_and_never_retries_or_refunds(self):
+        with patch.object(job2.HTTP, "open", side_effect=TimeoutError(self.key)) as opened:
+            with self.assertRaises(RuntimeError):
+                self.client.complete(self.messages, self.schema)
+            reserved = self.client.budget["reserved_usd"]
+            with self.assertRaises(RuntimeError):
+                job2.OpenRouterClient(api_key=self.key).complete(self.messages, self.schema)
+        self.assertEqual(opened.call_count, 1)
+        self.assertGreater(Decimal(reserved), 0)
+        self.assertEqual(self.client.budget["reserved_usd"], reserved)
+        self.assertNotIn(self.key, json.dumps(job2.STATE))
+
+    def test_missing_or_excess_usage_halts_without_additional_request(self):
+        for usage in ({"prompt_tokens": 1}, {"prompt_tokens": 1, "completion_tokens": 8001,
+                                              "total_tokens": 8002, "cost": 0.001}):
+            with self.subTest(usage=usage), patch.object(job2, "STATE", {"exchanges": []}):
+                client = job2.OpenRouterClient(api_key=self.key)
+                with patch.object(job2.HTTP, "open", return_value=completion_reply(usage=usage)) as opened:
+                    with self.assertRaises(RuntimeError):
+                        client.complete(self.messages, self.schema)
+                    with self.assertRaises(RuntimeError):
+                        client.complete(self.messages, self.schema)
+                self.assertEqual(opened.call_count, 1)
+
+    def test_reported_cost_over_bound_is_recorded_then_stops(self):
+        usage = {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200, "cost": 1.1}
+        with patch.object(job2.HTTP, "open", return_value=completion_reply(usage=usage)) as opened:
+            with self.assertRaises(RuntimeError):
+                self.client.complete(self.messages, self.schema)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(self.client.budget["reported_usd"], "1.1")
+        self.assertTrue(self.client.budget["halted"])
+
+    def test_wrong_model_or_truncated_completion_does_not_fallback(self):
+        for reply in (completion_reply(model="different-model"), completion_reply(choices=[{
+                "finish_reason": "length", "message": {"content": "partial"}}])):
+            with patch.object(job2, "STATE", {"exchanges": []}):
+                client = job2.OpenRouterClient(api_key=self.key)
+                with patch.object(job2.HTTP, "open", return_value=reply) as opened:
+                    with self.assertRaises(RuntimeError):
+                        client.complete(self.messages, self.schema)
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(client.budget["reported_usd"], "0.001")
+
+    def test_http_error_usage_is_recorded_without_auth_or_retry(self):
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0}
+        error = job2.urllib.error.HTTPError(job2.OPENROUTER_URL, 429, self.key, {},
+                                          io.BytesIO(job2.json_bytes({"usage": usage})))
+        with patch.object(job2.HTTP, "open", side_effect=error) as opened:
+            with self.assertRaises(RuntimeError):
+                self.client.complete(self.messages, self.schema)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(self.client.budget["reported_usd"], "0")
+        self.assertNotIn(self.key, json.dumps(job2.STATE))
+
+    def test_redirect_is_forbidden(self):
+        with self.assertRaises(RuntimeError):
+            job2.NoRedirect().redirect_request(None, None, 307, "redirect", {}, "https://example.invalid")
+
+    def test_key_echo_is_redacted_and_mcp_secrets_are_blocked(self):
+        with patch.object(job2.HTTP, "open", return_value=completion_reply(self.key)):
+            self.assertEqual(self.client.complete(self.messages, self.schema), "[REDACTED]")
+        self.assertNotIn(self.key, json.dumps(job2.STATE))
+        job2.STATE["step"] = "synthetic-private-step-value"
+        with self.assertRaisesRegex(RuntimeError, "sensitive"):
+            self.client.complete([{"role": "user", "content": job2.STATE["step"]}], self.schema)
+        with patch.dict(job2.os.environ, {"MEGA_JOB2_URL": "https://example.invalid/private-capability"}):
+            with self.assertRaisesRegex(RuntimeError, "sensitive"):
+                self.client.complete([{"role": "user", "content": job2.os.environ["MEGA_JOB2_URL"]}], self.schema)
+
+    def test_two_call_extraction_can_correct_omissions_and_projects_only_transcript(self):
+        transcript = synthetic_transcript()
+        transcript[0]["internal_step"] = "extra-private-field-never-send"
+        first = synthetic_ledger()
+        first["segments"][1]["events"].pop()
+        job2.STATE["step"] = "current-private-step-never-send"
+        with patch.object(job2, "OpenRouterClient", return_value=self.client), \
+                patch.object(job2.HTTP, "open", side_effect=[
+                    completion_reply(json.dumps(first)), completion_reply(json.dumps(synthetic_ledger(True)))]) as opened:
+            notes = job2.extract_notes("Synthetic skill; one note per occurrence.", transcript)
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(opened.call_count, 2)
+        for call in opened.call_args_list:
+            body = json.loads(call.args[0].data)
+            messages = json.dumps(body["messages"])
+            self.assertNotIn("current-private-step-never-send", messages)
+            self.assertNotIn("extra-private-field-never-send", messages)
+
+    def test_second_call_may_repair_malformed_candidate_but_never_a_third(self):
+        bad_final = synthetic_ledger(True)
+        bad_final["uncertain"] = True
+        with patch.object(job2, "OpenRouterClient", return_value=self.client), \
+                patch.object(job2.HTTP, "open", side_effect=[
+                    completion_reply("not valid JSON"), completion_reply(json.dumps(bad_final))]) as opened:
+            with self.assertRaisesRegex(RuntimeError, "review incomplete"):
+                job2.extract_notes("Synthetic skill.", synthetic_transcript())
+        self.assertEqual(opened.call_count, 2)
+        self.assertIn("candidate_validation", job2.STATE)
+        self.assertNotIn("notes", job2.STATE)
+
+
+    def test_final_verification_failures_never_publish_notes(self):
+        for mutation in ("issues", "incomplete", "unverified", "ungrounded", "missing", "json"):
+            final = synthetic_ledger(True)
+            if mutation == "issues":
+                final["issues"] = ["Unresolved scope"]
+            elif mutation == "incomplete":
+                final["complete_and_exact"] = False
+            elif mutation == "unverified":
+                final["segments"][0]["verified"] = False
+            elif mutation == "ungrounded":
+                final["segments"][1]["events"][0]["evidence"] = "Invented fault"
+            elif mutation == "missing":
+                final["segments"].pop()
+            final_text = "not JSON" if mutation == "json" else json.dumps(final)
+            with self.subTest(mutation=mutation), patch.object(job2, "STATE", {"exchanges": []}), \
+                    patch.object(job2.OpenRouterClient, "complete", side_effect=[
+                        json.dumps(synthetic_ledger()), final_text]) as complete, \
+                    patch.dict(job2.os.environ, {"OPENROUTER_API_KEY": self.key}):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    job2.extract_notes("Synthetic skill.", synthetic_transcript())
+                self.assertEqual(complete.call_count, 2)
+                self.assertNotIn("notes", job2.STATE)
+
+    def test_cancelled_request_keeps_pending_reservation_and_cannot_retry(self):
+        with patch.object(job2.HTTP, "open", side_effect=job2.WorkerStopped()) as opened:
+            with self.assertRaises(job2.WorkerStopped):
+                self.client.complete(self.messages, self.schema)
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                self.client.complete(self.messages, self.schema)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(self.client.budget["requests"][0]["status"], "pending")
+        self.assertGreater(Decimal(self.client.budget["reserved_usd"]), 0)
+
+
+class ApprovalTests(unittest.TestCase):
+    def test_missing_approval_or_key_blocks_before_encryption_and_job_calls(self):
+        for approval, key in (("false", "synthetic-key"), ("", "synthetic-key"), ("true", "")):
+            with self.subTest(approval=approval, has_key=bool(key)), \
+                    patch.dict(job2.os.environ, {"GITHUB_ACTIONS": "true",
+                        "RUNNER_ENVIRONMENT": "github-hosted", "MEGA_APPROVE_OPENROUTER": approval,
+                        "OPENROUTER_API_KEY": key}), \
+                    patch.object(job2, "encrypt_result") as encrypt, \
+                    patch.object(job2, "execute_job") as execute, patch("builtins.print"):
+                self.assertEqual(job2.main(), 1)
+                encrypt.assert_not_called()
+                execute.assert_not_called()
 
 
 class CheckpointTests(unittest.TestCase):
@@ -341,118 +520,14 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(job2.STOP_REQUESTED)
 
 
-class BudgetTests(unittest.TestCase):
-    def test_alarm_is_disarmed_and_restored_on_inference_failure(self):
-        with patch.object(job2.signal, "signal", return_value="synthetic-previous-handler") as handler, \
-                patch.object(job2.signal, "setitimer") as timer, \
-                patch.object(job2, "load_and_extract", side_effect=job2.InferenceTimeout("synthetic timeout")):
-            with self.assertRaises(job2.InferenceTimeout):
-                job2.extract_notes("synthetic skill", [])
-        self.assertEqual([call.args for call in timer.call_args_list], [
-            (signal.ITIMER_REAL, job2.INFERENCE_SECONDS), (signal.ITIMER_REAL, 0)])
-        self.assertEqual(handler.call_args_list[-1].args,
-                         (signal.SIGALRM, "synthetic-previous-handler"))
-
-    def test_generation_and_wall_clock_bounds(self):
-        with patch.object(job2.time, "monotonic", return_value=100):
-            budget = job2.GenerationBudget(100)
-            self.assertEqual(budget.allowed_tokens(512), 512)
-            budget.used = job2.MAX_GENERATED_TOKENS
-            with self.assertRaises(RuntimeError):
-                budget.allowed_tokens(1)
-            budget.started = -1000
-            with self.assertRaises(job2.InferenceTimeout):
-                budget.remaining_seconds()
-
-    def test_source_unit_bounds_never_truncate(self):
-        with patch.object(job2, "MAX_UNITS", 1), self.assertRaises(RuntimeError):
-            job2.source_units([{"at": "0:00", "text": "Hello. Goodbye."}])
-
-    def test_source_word_bounds_never_truncate(self):
-        with patch.object(job2, "MAX_WORDS_PER_UNIT", 2), self.assertRaises(RuntimeError):
-            job2.source_units([{"at": "0:00", "text": "Line C reset."}])
-
-    def test_only_complete_json_is_accepted(self):
-        self.assertEqual(job2.parse_json_output("```json\n[[],[[0,3]]]\n```"), [[], [[0, 3]]])
-        with self.assertRaises(ValueError):
-            job2.parse_json_output("[[],[[0,")
-
-
-class ConstrainedReplyTests(unittest.TestCase):
-    def test_token_trie_forbids_strings_missing_rows_and_extra_text(self):
-        # Character tokens stand in for real tokenizer encodings; no model is loaded.
-        choices = ["[0]", "[1]", "[2]"]
-        trie = job2.ChoiceTrie([list(map(ord, choice)) for choice in choices])
-        self.assertEqual(trie.allowed([], 999), [ord("[")])
-        self.assertEqual(trie.allowed([ord("[")], 999), [ord("0"), ord("1"), ord("2")])
-        self.assertTrue(trie.complete(list(map(ord, "[1]"))))
-        self.assertFalse(trie.complete(list(map(ord, "[1"))))
-        self.assertEqual(trie.allowed(list(map(ord, "[1]")), 999), [999])
-        for bad in ('["', "[[", "[9", "[1]extra"):
-            with self.subTest(bad=bad), self.assertRaises(job2.InvalidModelOutput):
-                trie.node(list(map(ord, bad)))
-
-    def test_pair_trie_accepts_only_listed_nonoverlapping_word_bounds(self):
-        trie = job2.ChoiceTrie([list(map(ord, choice)) for choice in ("[3,4]", "[3,5]", "[4,5]")])
-        self.assertTrue(trie.complete(list(map(ord, "[3,5]"))))
-        with self.assertRaises(job2.InvalidModelOutput):
-            trie.node(list(map(ord, "[2,")))
-
-    def test_trie_supports_variable_length_subword_tokenizations(self):
-        trie = job2.ChoiceTrie([[10, 11], [10, 12, 13]])
-        self.assertEqual(trie.max_tokens, 3)
-        self.assertEqual(trie.allowed([10], 99), [11, 12])
-        self.assertTrue(trie.complete([10, 11]))
-        self.assertFalse(trie.complete([10, 12]))
-        self.assertEqual(trie.allowed([10, 12], 99), [13])
-
-    def test_no_choices_fails_without_inference(self):
-        def infer(*args):
-            self.fail("inference must not be attempted with an empty grammar")
-        with self.assertRaises(RuntimeError):
-            job2.ask_choice(infer, "synthetic prompt", [])
-
-    def test_invalid_response_has_at_most_one_repair(self):
-        calls = []
-        def invalid(prompt, choices):
-            calls.append(prompt)
-            return [["arbitrary", "strings"]]
-        with patch.object(job2, "STATE", {"phase": "inference_count"}), \
-                patch.object(job2, "audit"), self.assertRaises(job2.InvalidModelOutput):
-            job2.ask_choice(invalid, "synthetic prompt", ["[0]", "[1]"])
-        self.assertEqual(len(calls), 2)
-        self.assertIn("Format repair", calls[1])
-
-    def test_truncated_json_can_repair_once(self):
-        calls = []
-        def infer(prompt, choices):
-            calls.append(prompt)
-            if len(calls) == 1:
-                raise job2.InvalidModelOutput("synthetic truncated JSON")
-            return [1]
-        with patch.object(job2, "STATE", {"phase": "inference_verify"}), patch.object(job2, "audit"):
-            self.assertEqual(job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"]), [1])
-        self.assertEqual(len(calls), 2)
-
-    def test_semantically_rejecting_reply_is_not_repaired(self):
-        calls = []
-        def infer(prompt, choices):
-            calls.append(prompt)
-            return [0]
-        self.assertEqual(job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"]), [0])
-        self.assertEqual(len(calls), 1)
-
-    def test_deadline_is_never_treated_as_a_format_error(self):
-        calls = []
-        def infer(prompt, choices):
-            calls.append(prompt)
-            raise job2.InferenceTimeout("synthetic timeout")
-        with self.assertRaises(job2.InferenceTimeout):
-            job2.ask_choice(infer, "synthetic prompt", ["[0]", "[1]"])
-        self.assertEqual(len(calls), 1)
-
-
 class DiagnosticTests(unittest.TestCase):
+    def test_diagnostic_redacts_api_key(self):
+        key = "synthetic-private-provider-key"
+        with patch.dict(job2.os.environ, {"OPENROUTER_API_KEY": key}):
+            diagnostic = job2.failure_diagnostics(RuntimeError("echoed " + key))
+        self.assertEqual(diagnostic["message"], "echoed [REDACTED]")
+        self.assertNotIn(key, json.dumps(diagnostic))
+
     def test_traceback_has_no_locals_or_source_lines(self):
         try:
             raise RuntimeError("synthetic private diagnostic")
