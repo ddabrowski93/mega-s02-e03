@@ -97,6 +97,36 @@ virtual environment, not globally. The model uses safetensors, disallows custom
 remote Python code, uses deterministic generation, grounds each finding in an
 exact segment substring, and performs a second coverage/timestamp review.
 
+### Parser and extraction safeguards
+
+The transcript parser accepts the job's `at: "m:ss"` segments and numeric `start`
+segments. Supplied `at` strings are preserved exactly; whole-second `start` values
+are formatted without rounding. Fractional, missing, invalid, or conflicting offsets
+stop the worker rather than inventing a timestamp. Original segment data is not
+rewritten.
+
+Remote extraction creates a coverage ledger with a row for **every** segment,
+including chatter, and a separate entry for every event occurrence. Notes quote
+the actual event wording and any necessary clock/date/timezone/line context from
+validated source substrings. Spoken times and timezone context are not normalized
+or paraphrased. A second inference pass must positively audit every segment for
+coverage, repeats, one-event grouping, timestamps, and inherited context. Audit
+issues allow up to two remote repair passes before stopping, always before memo
+writes. Generated responses and diagnostics remain encrypted. This increases
+checks, but does not make a small language model infallible. Confirmation counts
+duplicate notes rather than treating repeated findings as a set.
+
+Failures now retain an encrypted phase, exception type/module/message, and traceback
+frame basenames/function names/line numbers. No traceback source, locals, absolute
+paths, or diagnostic messages are printed in public logs. Raw RPC logs remain
+encrypted as before.
+
+Offline synthetic tests (no private files, HTTP, model loading, or job execution):
+
+```sh
+python3 -B -m unittest discover -s tests -v
+```
+
 **Limitations:** a small local language model is not a guarantee of correct or
 complete extraction; only the job's acceptance is authoritative. Its model
 revision and transitive pip dependencies are not locked. The model may exceed
